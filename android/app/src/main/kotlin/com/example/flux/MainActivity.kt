@@ -21,24 +21,38 @@ import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 class MainActivity : FlutterActivity() {
     private val CHANNEL = "com.example.flux/v2ray"
     private val STATUS_CHANNEL = "com.example.flux/v2ray_status"
+    private val SINGBOX_CHANNEL = "com.example.flux/singbox"
+    private val SINGBOX_STATUS_CHANNEL = "com.example.flux/singbox_status"
     private var isV2rayRunning = false
     private var xrayProcess: Process? = null
-    // private var hysteria2Process: Process? = null // Removed
     private var currentProtocol: String = ""
     private var isInitialized = false
     private var isGeoDataReady = false
+
+    // Pending sing-box config while waiting for VPN permission
+    private var pendingSingboxConfig: String? = null
     
     companion object {
         private const val TAG = "Flux"
         private const val REQUEST_VPN_PERMISSION = 1
+        private const val REQUEST_SINGBOX_VPN_PERMISSION = 2
         @Volatile
         private var vpnStatusSink: EventChannel.EventSink? = null
+        @Volatile
+        private var singboxStatusSink: EventChannel.EventSink? = null
         private val mainHandler = Handler(Looper.getMainLooper())
 
         @JvmStatic
         fun emitVpnStatus(isConnected: Boolean) {
             mainHandler.post {
                 vpnStatusSink?.success(isConnected)
+            }
+        }
+
+        @JvmStatic
+        fun emitSingboxStatus(isConnected: Boolean) {
+            mainHandler.post {
+                singboxStatusSink?.success(isConnected)
             }
         }
     }
@@ -97,6 +111,59 @@ class MainActivity : FlutterActivity() {
                     vpnStatusSink = null
                 }
             })
+
+        // ── sing-box MethodChannel (for AnyTLS and other sing-box protocols) ──
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, SINGBOX_CHANNEL)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "connect" -> {
+                        val configJson = call.argument<String>("config")
+                        if (configJson == null) {
+                            result.error("INVALID_ARGUMENT", "Config is null", null)
+                            return@setMethodCallHandler
+                        }
+                        Thread {
+                            try {
+                                val success = connectSingbox(configJson)
+                                mainHandler.post { result.success(success) }
+                            } catch (e: Exception) {
+                                mainHandler.post {
+                                    result.error("SINGBOX_ERROR", e.message, null)
+                                }
+                            }
+                        }.start()
+                    }
+                    "disconnect" -> {
+                        Thread {
+                            try {
+                                disconnectSingbox()
+                                mainHandler.post { result.success(true) }
+                            } catch (e: Exception) {
+                                mainHandler.post {
+                                    result.error("SINGBOX_ERROR", e.message, null)
+                                }
+                            }
+                        }.start()
+                    }
+                    "isConnected" -> {
+                        result.success(SingboxVpnService.isRunning)
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+
+        // sing-box status EventChannel
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, SINGBOX_STATUS_CHANNEL)
+            .setStreamHandler(object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                    singboxStatusSink = events
+                    events?.success(SingboxVpnService.isRunning)
+                }
+
+                override fun onCancel(arguments: Any?) {
+                    singboxStatusSink = null
+                }
+            })
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -119,6 +186,7 @@ class MainActivity : FlutterActivity() {
     override fun onDestroy() {
         super.onDestroy()
         disconnectV2ray()
+        disconnectSingbox()
     }
 
     /**
@@ -315,8 +383,17 @@ class MainActivity : FlutterActivity() {
     
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == REQUEST_VPN_PERMISSION && resultCode == RESULT_OK) {
-            startVpnService()
+        if (resultCode == RESULT_OK) {
+            when (requestCode) {
+                REQUEST_VPN_PERMISSION -> startVpnService()
+                REQUEST_SINGBOX_VPN_PERMISSION -> {
+                    val config = pendingSingboxConfig
+                    pendingSingboxConfig = null
+                    if (config != null) {
+                        startSingboxVpnService(config)
+                    }
+                }
+            }
         }
     }
     
@@ -340,6 +417,56 @@ class MainActivity : FlutterActivity() {
             stopService(intent)
         } catch (e: Exception) {
             Log.e(TAG, "Error stopping VPN service: ${e.message}")
+        }
+    }
+
+    // ── sing-box engine methods ──────────────────────────────────────────
+
+    private fun connectSingbox(configJson: String): Boolean {
+        // Stop any running V2Ray connection first (only one VPN can be active)
+        if (isV2rayRunning) {
+            Log.d(TAG, "Stopping V2Ray before starting sing-box")
+            disconnectV2ray()
+            Thread.sleep(500)
+        }
+        // Also stop any existing sing-box connection
+        if (SingboxVpnService.isRunning) {
+            disconnectSingbox()
+            Thread.sleep(300)
+        }
+
+        // Request VPN permission if needed
+        val vpnIntent = VpnService.prepare(this)
+        if (vpnIntent != null) {
+            pendingSingboxConfig = configJson
+            startActivityForResult(vpnIntent, REQUEST_SINGBOX_VPN_PERMISSION)
+            return true // Permission will be granted asynchronously
+        }
+
+        startSingboxVpnService(configJson)
+        return true
+    }
+
+    private fun startSingboxVpnService(configJson: String) {
+        try {
+            val intent = Intent(this, SingboxVpnService::class.java).apply {
+                action = SingboxVpnService.ACTION_START
+                putExtra(SingboxVpnService.EXTRA_CONFIG, configJson)
+            }
+            startService(intent)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error starting sing-box VPN service: ${e.message}")
+        }
+    }
+
+    private fun disconnectSingbox() {
+        try {
+            val intent = Intent(this, SingboxVpnService::class.java).apply {
+                action = SingboxVpnService.ACTION_STOP
+            }
+            startService(intent)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error stopping sing-box: ${e.message}")
         }
     }
 

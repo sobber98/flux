@@ -6,6 +6,7 @@ import 'dart:math';
 import 'package:path/path.dart' as path;
 import 'package:path_provider/path_provider.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import '../models/server_node.dart';
 
 /// Sing-box service for stable Tun mode support
@@ -19,8 +20,94 @@ class SingboxService {
   bool _isConnected = false;
   final _statusController = StreamController<bool>.broadcast();
 
+  // Mobile platform MethodChannel for sing-box engine
+  static const MethodChannel _singboxChannel =
+      MethodChannel('com.example.flux/singbox');
+  static const EventChannel _singboxStatusChannel =
+      EventChannel('com.example.flux/singbox_status');
+  static Stream<bool>? _mobileStatusStream;
+
   Stream<bool> get statusStream => _statusController.stream;
   bool get isConnected => _isConnected;
+
+  /// Mobile status stream (from native sing-box VPN service)
+  Stream<bool> get mobileStatusStream {
+    _mobileStatusStream ??= _singboxStatusChannel
+        .receiveBroadcastStream()
+        .map((event) => event == true || event == 1)
+        .handleError((e) {
+      debugPrint('[SingboxService] Mobile status stream error: $e');
+    });
+    return _mobileStatusStream!;
+  }
+
+  /// Connect via sing-box on mobile (Android/iOS)
+  /// Used for protocols not supported by V2Ray, such as AnyTLS
+  Future<bool> connectMobile(ServerNode node, {
+    int socksPort = 10808,
+    int httpPort = 10809,
+    bool isGlobal = false,
+  }) async {
+    if (!Platform.isAndroid && !Platform.isIOS) {
+      // Desktop: fall back to the existing TUN-based method
+      return connectWithTun(node, socksPort: socksPort, httpPort: httpPort, isGlobal: isGlobal);
+    }
+
+    try {
+      debugPrint('[SingboxService] Connecting via sing-box mobile (protocol: ${node.protocol})');
+
+      final customRules = isGlobal
+          ? {'dns': <Map<String, dynamic>>[], 'route': <Map<String, dynamic>>[]}
+          : await _loadCustomRules();
+
+      final tunName = 'flux_tun_${Random().nextInt(9000) + 1000}';
+
+      final config = _buildSingboxConfig(
+        node,
+        socksPort: socksPort,
+        httpPort: httpPort,
+        customDnsRules: customRules['dns'],
+        customRouteRules: customRules['route'],
+        isGlobal: isGlobal,
+        tunInterfaceName: tunName,
+      );
+
+      final configJson = jsonEncode(config);
+
+      final result = await _singboxChannel.invokeMethod('connect', {
+        'config': configJson,
+      });
+
+      final success = result == true;
+      _isConnected = success;
+      _statusController.add(success);
+      debugPrint('[SingboxService] Mobile connect result: $success');
+      return success;
+    } catch (e) {
+      debugPrint('[SingboxService] Mobile connect failed: $e');
+      _isConnected = false;
+      _statusController.add(false);
+      return false;
+    }
+  }
+
+  /// Disconnect sing-box on mobile (Android/iOS)
+  Future<bool> disconnectMobile() async {
+    if (!Platform.isAndroid && !Platform.isIOS) {
+      return disconnect();
+    }
+
+    try {
+      debugPrint('[SingboxService] Disconnecting sing-box mobile');
+      await _singboxChannel.invokeMethod('disconnect');
+      _isConnected = false;
+      _statusController.add(false);
+      return true;
+    } catch (e) {
+      debugPrint('[SingboxService] Mobile disconnect failed: $e');
+      return false;
+    }
+  }
 
   /// Start sing-box with Tun mode for the given node
   Future<bool> connectWithTun(ServerNode node, {
@@ -652,6 +739,23 @@ while (\$true) {
           "mtu": raw['mtu'] ?? 1280
         };
       
+      case 'anytls':
+        return {
+          "type": "anytls",
+          "tag": "proxy",
+          "server": node.address,
+          "server_port": node.port,
+          "password": raw['password'] ?? node.uuid ?? '',
+          "idle_session_check_interval": "30s",
+          "idle_session_timeout": "30s",
+          "min_idle_session": 5,
+          "tls": {
+            "enabled": true,
+            "server_name": raw['sni'] ?? node.address,
+            "insecure": raw['insecure'] == true || raw['insecure'] == '1',
+          },
+        };
+
       default:
         // Fallback to VLESS
         return {

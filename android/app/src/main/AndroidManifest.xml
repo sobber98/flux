@@ -36,9 +36,19 @@
               />
         </activity>
         
-        <!-- VPN 服务 -->
+        <!-- VPN 服务 (V2Ray/Xray) -->
         <service
             android:name="com.example.flux.FluxVpnService"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
+
+        <!-- VPN 服务 (sing-box / AnyTLS) -->
+        <service
+            android:name="com.example.flux.SingboxVpnService"
             android:permission="android.permission.BIND_VPN_SERVICE"
             android:exported="false">
             <intent-filter>

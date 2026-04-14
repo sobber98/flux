@@ -14,6 +14,9 @@ class ServerNode {
   int? latency; // 延迟（毫秒）
   bool isSelected;
 
+  /// 判断节点是否需要 sing-box 内核（V2Ray/Xray 不支持的协议）
+  bool get requiresSingbox => protocol.toLowerCase() == 'anytls';
+
   ServerNode({
     required this.name,
     required this.address,
@@ -94,6 +97,21 @@ class ServerNode {
           uuid: config['uuid'] as String?,
           network: config['network'] as String? ?? 'tcp',
           rawConfig: config,
+        );
+      case 'anytls':
+        return ServerNode(
+          name: name,
+          address: server,
+          port: port,
+          protocol: 'anytls',
+          uuid: config['password'] as String?,
+          rawConfig: {
+            ...config,
+            'password': config['password'],
+            if (config['sni'] != null) 'sni': config['sni'],
+            if (config['server-name'] != null) 'sni': config['server-name'],
+            if (config['skip-cert-verify'] != null) 'insecure': config['skip-cert-verify'],
+          },
         );
       default:
         // 不支持的协议类型
@@ -469,7 +487,6 @@ class ServerNode {
         final sni = (rawConfig?['sni'] as String?)?.isNotEmpty == true
             ? rawConfig!['sni'] as String
             : (host ?? address.trim());
-        final allowInsecure = rawConfig?['allowInsecure'] == true || rawConfig?['insecure'] == true;
         streamSettings['security'] = 'reality';
         streamSettings['realitySettings'] = <String, dynamic>{
           if (sni.isNotEmpty) 'serverName': sni,
@@ -600,6 +617,9 @@ class ServerNode {
         },
       };
       return outbound;
+    } else if (protocol == 'anytls') {
+      // AnyTLS protocol is handled by sing-box engine, not V2Ray/Xray
+      return {};
     }
     // 不支持的协议
     return {};
@@ -840,6 +860,64 @@ class ServerNode {
     }
   }
 
+  /// Parse AnyTLS Link (anytls://)
+  /// Format: anytls://password@server:port/?sni=example.com&insecure=0#name
+  static ServerNode? fromAnytls(String link) {
+    try {
+      if (!link.startsWith('anytls://')) return null;
+
+      final uri = Uri.parse(link);
+      final password = Uri.decodeComponent(uri.userInfo);
+
+      String address = uri.host;
+      int port = uri.port > 0 ? uri.port : 443;
+
+      // Fallback manual parsing for edge cases
+      if (address.isEmpty) {
+        try {
+          final noScheme = link.substring('anytls://'.length);
+          final atIndex = noScheme.lastIndexOf('@');
+          if (atIndex != -1) {
+            final hostPortPart = noScheme.substring(atIndex + 1).split('/')[0].split('?')[0].split('#')[0];
+            if (hostPortPart.startsWith('[')) {
+              // IPv6
+              final closeBracket = hostPortPart.indexOf(']');
+              address = hostPortPart.substring(1, closeBracket);
+              if (closeBracket + 1 < hostPortPart.length && hostPortPart[closeBracket + 1] == ':') {
+                port = int.tryParse(hostPortPart.substring(closeBracket + 2)) ?? 443;
+              }
+            } else {
+              final parts = hostPortPart.split(':');
+              address = parts[0];
+              if (parts.length > 1) port = int.tryParse(parts[1]) ?? 443;
+            }
+          }
+        } catch (_) {}
+      }
+
+      final query = uri.queryParameters;
+      final sni = query['sni'];
+      final insecure = _parseBool(query['insecure']);
+
+      final name = _decodeNodeName(uri.fragment, fallback: 'AnyTLS');
+
+      return ServerNode(
+        name: name,
+        address: address,
+        port: port,
+        protocol: 'anytls',
+        uuid: password,
+        rawConfig: {
+          'password': password,
+          if (sni != null) 'sni': sni,
+          if (insecure != null) 'insecure': insecure,
+        },
+      );
+    } catch (e) {
+      return null;
+    }
+  }
+
   /// Universal Parser
   static List<ServerNode> parseFromContent(String content) {
     if (content.trim().isEmpty) return [];
@@ -909,6 +987,8 @@ class ServerNode {
         node = fromTuic(line);
       } else if (line.startsWith('wg://') || line.startsWith('wireguard://')) {
         node = fromWireGuard(line);
+      } else if (line.startsWith('anytls://')) {
+        node = fromAnytls(line);
       }
 
       if (node != null) {
@@ -928,7 +1008,8 @@ class ServerNode {
            s.startsWith('trojan://') || 
            s.startsWith('tuic://') ||
            s.startsWith('wg://') ||
-           s.startsWith('wireguard://');
+           s.startsWith('wireguard://') ||
+           s.startsWith('anytls://');
   }
 
   static bool _isPrintable(String s) {

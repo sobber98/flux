@@ -14,6 +14,9 @@ import 'singbox_service.dart';
 
 enum ProxyRoutingMode { global, rule }
 
+/// Tracks which VPN engine is currently active
+enum ActiveEngine { none, v2ray, singbox }
+
 /// V2ray服务 - 全平台统一入口
 class V2rayService {
   static const MethodChannel _channel = MethodChannel('com.example.flux/v2ray');
@@ -29,6 +32,9 @@ class V2rayService {
   bool _desktopConnected = false;
   final _desktopStatusController = StreamController<bool>.broadcast();
 
+  // 当前活跃的 VPN 引擎（用于 disconnect 路由）
+  ActiveEngine _activeEngine = ActiveEngine.none;
+
   // 单例模式 (确保全局状态一致)
   static final V2rayService _instance = V2rayService._internal();
   factory V2rayService() => _instance;
@@ -38,12 +44,11 @@ class V2rayService {
     if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) {
       return _desktopStatusController.stream;
     }
-    return _statusStream ??= _statusChannel.receiveBroadcastStream().map((
-      event,
-    ) {
+    _statusStream ??= _statusChannel.receiveBroadcastStream().map((event) {
       if (event is bool) return event;
       return event == true;
     });
+    return _statusStream!;
   }
 
   // 动态端口
@@ -122,8 +127,30 @@ class V2rayService {
     // 2. 移动端处理 (Android / iOS)
     if (Platform.isFuchsia) return false;
 
+    // Route protocols that require sing-box engine (e.g., AnyTLS)
+    if (node.requiresSingbox) {
+      _log('Mobile: Routing ${node.protocol} to sing-box engine');
+      // Disconnect any existing V2Ray connection first
+      if (_activeEngine == ActiveEngine.v2ray) {
+        try { await _channel.invokeMethod<bool>('disconnect'); } catch (_) {}
+      }
+      final success = await SingboxService().connectMobile(
+        node,
+        socksPort: _socksPort,
+        httpPort: _httpPort,
+        isGlobal: _routingMode == ProxyRoutingMode.global,
+      );
+      if (success) _activeEngine = ActiveEngine.singbox;
+      return success;
+    }
+
     await _ensureMobileAssets();
     try {
+      // Disconnect any existing sing-box connection first
+      if (_activeEngine == ActiveEngine.singbox) {
+        await SingboxService().disconnectMobile();
+      }
+
       final resolvedNode = await _resolveServerAddress(node);
       final outboundConfig = resolvedNode.toV2rayConfig();
 
@@ -161,7 +188,9 @@ class V2rayService {
       final result = await _channel.invokeMethod<bool>('connect', {
         'config': jsonEncode(fullConfig),
       });
-      return result ?? false;
+      final success = result ?? false;
+      if (success) _activeEngine = ActiveEngine.v2ray;
+      return success;
     } on PlatformException catch (_) {
       return false;
     }
@@ -764,7 +793,7 @@ class V2rayService {
 
       return ServerNode(
         name: node.name,
-        address: ip!,
+        address: ip,
         port: node.port,
         protocol: node.protocol,
         uuid: node.uuid,
@@ -802,7 +831,14 @@ class V2rayService {
 
     // 移动端处理
     try {
+      if (_activeEngine == ActiveEngine.singbox) {
+        // Disconnect sing-box engine (used by anytls etc.)
+        final result = await SingboxService().disconnectMobile();
+        _activeEngine = ActiveEngine.none;
+        return result;
+      }
       final result = await _channel.invokeMethod<bool>('disconnect');
+      _activeEngine = ActiveEngine.none;
       return result ?? false;
     } on PlatformException catch (_) {
       return false;
@@ -815,6 +851,9 @@ class V2rayService {
       return _desktopConnected;
     }
     try {
+      if (_activeEngine == ActiveEngine.singbox) {
+        return SingboxService().isConnected;
+      }
       final result = await _channel.invokeMethod<bool>('isConnected');
       return result ?? false;
     } on PlatformException catch (_) {

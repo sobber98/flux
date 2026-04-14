@@ -52,7 +52,7 @@ gomobile bind -v \
   -target=ios \
   -iosversion=12.0 \
   -ldflags="-s -w -buildid=" \
-  -tags="with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api" \
+  -tags="with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,with_reality_server,with_ech" \
   -o "$BUILD_DIR/Libbox.xcframework" \
   github.com/sagernet/sing-box/experimental/libbox
 

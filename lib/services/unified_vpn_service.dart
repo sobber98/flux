@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import '../models/server_node.dart';
-import 'platform_service.dart';
+import 'singbox_service.dart';
 import 'v2ray_service.dart';
 
 /// 统一 VPN 服务 - 根据平台自动选择合适的实现
@@ -12,16 +12,35 @@ class UnifiedVpnService {
   
   UnifiedVpnService._();
   
-  final _platform = PlatformService.instance;
   final _vpnService = V2rayService();
   
-  /// 连接状态流
+  // Merged status stream controller for both V2Ray and sing-box engines
+  StreamController<bool>? _mergedStatusController;
+  StreamSubscription<bool>? _v2rayStatusSub;
+  StreamSubscription<bool>? _singboxStatusSub;
+
+  /// 连接状态流 (merges V2Ray and sing-box status updates)
   Stream<bool> get statusStream {
     if (kIsWeb) {
       return Stream.value(false);
     }
-    // V2rayService 现在处理所有平台逻辑 (Win/Mac/Linux/Android/iOS)
-    return _vpnService.statusStream;
+    if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) {
+      // Desktop: V2rayService handles everything (including desktop sing-box)
+      return _vpnService.statusStream;
+    }
+    // Mobile: merge V2Ray native status + sing-box mobile status
+    if (_mergedStatusController == null) {
+      _mergedStatusController = StreamController<bool>.broadcast();
+      _v2rayStatusSub = _vpnService.statusStream.listen(
+        (status) => _mergedStatusController?.add(status),
+        onError: (e) => debugPrint('[UnifiedVPN] V2Ray status error: $e'),
+      );
+      _singboxStatusSub = SingboxService().mobileStatusStream.listen(
+        (status) => _mergedStatusController?.add(status),
+        onError: (e) => debugPrint('[UnifiedVPN] Singbox status error: $e'),
+      );
+    }
+    return _mergedStatusController!.stream;
   }
   
   /// 连接到指定节点
@@ -48,6 +67,9 @@ class UnifiedVpnService {
   
   /// 释放资源
   void dispose() {
-    // V2rayService 不需要显式 dispose，或者可以在其内部实现
+    _v2rayStatusSub?.cancel();
+    _singboxStatusSub?.cancel();
+    _mergedStatusController?.close();
+    _mergedStatusController = null;
   }
 }
